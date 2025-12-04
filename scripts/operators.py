@@ -93,6 +93,15 @@ class Custom(Operator):
     async def __call__(self, input, instruction):
         prompt = instruction + input
         response = await self._fill_node(GenerateOp, prompt, mode="single_fill")
+        # Standardize return format
+        if isinstance(response, dict):
+            if "error" in response:
+                response["success"] = False
+            else:
+                response["success"] = True
+            # Ensure response field exists
+            if "response" not in response and "content" in response:
+                response["response"] = response["content"]
         return response
 
 
@@ -103,6 +112,15 @@ class AnswerGenerate(Operator):
     async def __call__(self, input: str) -> Tuple[str, str]:
         prompt = ANSWER_GENERATION_PROMPT.format(input=input)
         response = await self._fill_node(AnswerGenerateOp, prompt, mode="xml_fill")
+        # Standardize return format with success flag
+        if isinstance(response, dict):
+            if "error" in response:
+                response["success"] = False
+            else:
+                response["success"] = True
+            # Ensure answer field exists
+            if "answer" not in response and "response" in response:
+                response["answer"] = response["response"]
         return response
 
 
@@ -186,27 +204,32 @@ def run_code(code):
 
 
 class Programmer(Operator):
-    def __init__(self, llm: AsyncLLM, name: str = "Programmer"):
+    def __init__(self, llm: AsyncLLM, name: str = "Programmer", timeout: int = 60):
         super().__init__(llm, name)
         # Create a class-level process pool, instead of creating a new one for each execution
         self.process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+        # Configurable timeout (default 60s, was hardcoded 30s)
+        self.timeout = timeout
 
     def __del__(self):
         """Ensure the process pool is closed when the object is destroyed"""
         if hasattr(self, 'process_pool'):
             self.process_pool.shutdown(wait=True)
 
-    async def exec_code(self, code, timeout=30):
+    async def exec_code(self, code, timeout=None):
         """
         Asynchronously execute code and return an error if timeout occurs.
+        Use instance timeout if not provided.
         """
         loop = asyncio.get_running_loop()
+        # Use provided timeout or fall back to instance timeout
+        actual_timeout = timeout if timeout is not None else self.timeout
 
         try:
             # Use the class-level process pool
             future = loop.run_in_executor(self.process_pool, run_code, code)
             # Wait for the task to complete or timeout
-            result = await asyncio.wait_for(future, timeout=timeout)
+            result = await asyncio.wait_for(future, timeout=actual_timeout)
             return result
         except asyncio.TimeoutError:
             # Only cancel this specific future, not the entire process pool
@@ -239,6 +262,7 @@ class Programmer(Operator):
     async def __call__(self, problem: str, analysis: str = "None"):
         """
         Call method, generate code and execute, retry up to 3 times.
+        Uses configurable timeout for code execution.
         """
         code = None
         output = None
@@ -247,10 +271,19 @@ class Programmer(Operator):
             code_response = await self.code_generate(problem, analysis, feedback, mode="code_fill")
             code = code_response.get("code")
             if not code:
-                return {"code": code, "output": "No code generated"}
-            status, output = await self.exec_code(code)
+                return {
+                    "code": code,
+                    "output": "No code generated",
+                    "success": False,
+                    "error": "Code generation failed"
+                }
+            status, output = await self.exec_code(code, timeout=self.timeout)
             if status == "Success":
-                return {"code": code, "output": output}
+                return {
+                    "code": code,
+                    "output": output,
+                    "success": True
+                }
             else:
                 print(f"Execution error on attempt {i + 1}, error message: {output}")
                 feedback = (
@@ -262,7 +295,12 @@ class Programmer(Operator):
             import gc
             gc.collect()
 
-        return {"code": code, "output": output}
+        return {
+            "code": code,
+            "output": output,
+            "success": False,
+            "error": f"Failed after 3 attempts. Last status: {status}"
+        }
 
 class Test(Operator):
     def __init__(self, llm: AsyncLLM, name: str = "Test"):
@@ -305,11 +343,17 @@ class Test(Operator):
         "description": "Test the solution with test cases, if the solution is correct, return 'no error'; if incorrect, reflect on the solution and the error information",
         "interface": "test(problem: str, solution: str, entry_point: str) -> str"
         }
+        Returns standardized format with success flag
         """
         for _ in range(test_loop):
             result = self.exec_code(solution, entry_point)
             if result == "no error":
-                return {"result": True, "solution": solution}
+                return {
+                    "result": True,
+                    "solution": solution,
+                    "success": True,
+                    "test_passed": True
+                }
             elif "exec_fail_case" in result:
                 result = result["exec_fail_case"]
                 prompt = REFLECTION_ON_PUBLIC_TEST_PROMPT.format(
@@ -319,7 +363,7 @@ class Test(Operator):
                     test_fail="executed unsucessfully",
                 )
                 response = await self._fill_node(ReflectionTestOp, prompt, mode="code_fill")
-                solution = response["response"]
+                solution = response.get("response", solution)
             else:
                 prompt = REFLECTION_ON_PUBLIC_TEST_PROMPT.format(
                     problem=problem,
@@ -328,13 +372,24 @@ class Test(Operator):
                     test_fail=result,
                 )
                 response = await self._fill_node(ReflectionTestOp, prompt, mode="code_fill")
-                solution = response["response"]
+                solution = response.get("response", solution)
 
         result = self.exec_code(solution, entry_point)
         if result == "no error":
-            return {"result": True, "solution": solution}
+            return {
+                "result": True,
+                "solution": solution,
+                "success": True,
+                "test_passed": True
+            }
         else:
-            return {"result": False, "solution": solution}
+            return {
+                "result": False,
+                "solution": solution,
+                "success": False,
+                "test_passed": False,
+                "error": str(result)
+            }
 
 
 class Format(Operator):
@@ -354,6 +409,15 @@ class Review(Operator):
     async def __call__(self, problem, solution, mode: str = None):
         prompt = REVIEW_PROMPT.format(problem=problem, solution=solution)
         response = await self._fill_node(ReviewOp, prompt, mode="xml_fill")
+        # Standardize return format with success flag
+        if isinstance(response, dict):
+            if "error" in response:
+                response["success"] = False
+            else:
+                response["success"] = True
+            # Ensure feedback field exists
+            if "feedback" not in response and "review_result" in response:
+                response["feedback"] = response["review_result"]
         return response
 
 
@@ -364,6 +428,16 @@ class Revise(Operator):
     async def __call__(self, problem, solution, feedback, mode: str = None):
         prompt = REVISE_PROMPT.format(problem=problem, solution=solution, feedback=feedback)
         response = await self._fill_node(ReviseOp, prompt, mode="xml_fill")
+        # Standardize return format with success flag
+        if isinstance(response, dict):
+            if "error" in response:
+                response["success"] = False
+                response["solution"] = solution  # Fallback to original solution on error
+            else:
+                response["success"] = True
+                # Ensure solution field exists
+                if "solution" not in response and "response" in response:
+                    response["solution"] = response["response"]
         return response
 
 
