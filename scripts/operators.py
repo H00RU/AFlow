@@ -306,60 +306,158 @@ class Test(Operator):
     def __init__(self, llm: AsyncLLM, name: str = "Test"):
         super().__init__(llm, name)
 
-    def exec_code(self, solution, entry_point):
-        test_cases = extract_test_cases_from_jsonl(entry_point)
+    def _extract_test_cases_from_string(self, test_string: str) -> List[str]:
+        """
+        Extract test cases from test string (e.g., function code with assert statements)
+
+        Args:
+            test_string: Complete test function code (e.g., "def check(candidate): assert ...")
+
+        Returns:
+            List of test cases (as test function definitions or formatted tests)
+        """
+        # For now, return the test_string as a single test case item
+        # The test_string contains the complete test function that can be executed
+        # We return it as a list with one element for compatibility with existing logic
+        if test_string and test_string.strip():
+            return [test_string]  # Return as single test case
+        return None
+
+    def exec_code(self, solution, entry_point, test_string: Optional[str] = None):
+        # Two modes:
+        # 1. Parameter mode (RL training): Use test_string provided directly (prioritized)
+        #    - test_string contains complete test function code
+        # 2. File mode (original): Read from JSONL file using entry_point
+        #    - test_cases are individual assert statements
 
         fail_cases = []
-        for test_case in test_cases:
-            test_code = test_case_2_test_function(solution, test_case, entry_point)
+
+        if test_string:
+            # Parameter mode: test_string is complete test code ready to execute
+            # Combine solution + test_string and execute directly
+            test_code = f"{solution}\n\n{test_string}"
+
+            # Count assertions in test_string for granular results
+            total_tests = test_string.count('assert')
+            if total_tests == 0:
+                total_tests = 1  # At least one test if test_string provided
+
             try:
                 exec(test_code, globals())
+                # All tests passed
+                return {
+                    "status": "success",
+                    "passed": total_tests,
+                    "total": total_tests,
+                    "pass_rate": 1.0
+                }
             except AssertionError as e:
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 tb_str = traceback.format_exception(exc_type, exc_value, exc_traceback)
-                with open("tester.txt", "a") as f:
-                    f.write("test_error of " + entry_point + "\n")
-                error_infomation = {
+                error_information = {
                     "test_fail_case": {
-                        "test_case": test_case,
+                        "test_case": test_string,
                         "error_type": "AssertionError",
                         "error_message": str(e),
                         "traceback": tb_str,
                     }
                 }
-                fail_cases.append(error_infomation)
+                # Conservative: assume first assertion failed
+                return {
+                    "status": "failed",
+                    "passed": 0,
+                    "total": total_tests,
+                    "pass_rate": 0.0,
+                    "error": [error_information]
+                }
             except Exception as e:
                 with open("tester.txt", "a") as f:
-                    f.write(entry_point + " " + str(e) + "\n")
-                return {"exec_fail_case": str(e)}
-        if fail_cases != []:
-            return fail_cases
+                    f.write(f"Parameter mode error for {entry_point}: {str(e)}\n")
+                return {
+                    "exec_fail_case": str(e),
+                    "status": "error",
+                    "passed": 0,
+                    "total": total_tests,
+                    "pass_rate": 0.0
+                }
         else:
-            return "no error"
+            # File mode: Original logic using test_cases from JSONL
+            test_cases = extract_test_cases_from_jsonl(entry_point)
 
-    async def __call__(self, problem, solution, entry_point, test_loop: int = 3):
+            # Handle None case for robustness
+            if test_cases is None:
+                return {"exec_fail_case": f"No test cases found for entry_point: {entry_point}"}
+
+            for test_case in test_cases:
+                test_code = test_case_2_test_function(solution, test_case, entry_point)
+                try:
+                    exec(test_code, globals())
+                except AssertionError as e:
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    tb_str = traceback.format_exception(exc_type, exc_value, exc_traceback)
+                    with open("tester.txt", "a") as f:
+                        f.write("test_error of " + entry_point + "\n")
+                    error_infomation = {
+                        "test_fail_case": {
+                            "test_case": test_case,
+                            "error_type": "AssertionError",
+                            "error_message": str(e),
+                            "traceback": tb_str,
+                        }
+                    }
+                    fail_cases.append(error_infomation)
+                except Exception as e:
+                    with open("tester.txt", "a") as f:
+                        f.write(entry_point + " " + str(e) + "\n")
+                    return {"exec_fail_case": str(e)}
+            if fail_cases != []:
+                return fail_cases
+            else:
+                return "no error"
+
+    async def __call__(self, problem, solution, entry_point, test_loop: int = 3, test_string: Optional[str] = None):
         """
         "Test": {
         "description": "Test the solution with test cases, if the solution is correct, return 'no error'; if incorrect, reflect on the solution and the error information",
-        "interface": "test(problem: str, solution: str, entry_point: str) -> str"
+        "interface": "test(problem: str, solution: str, entry_point: str, test_string: Optional[str] = None) -> str"
         }
-        Returns standardized format with success flag
+        Returns standardized format with success flag and test counts
+
+        Supports two modes:
+        1. File mode (original): Reads test cases from JSONL file using entry_point
+        2. Parameter mode (new): Uses test_string provided directly for RL training
         """
         for _ in range(test_loop):
-            result = self.exec_code(solution, entry_point)
-            if result == "no error":
+            result = self.exec_code(solution, entry_point, test_string)
+
+            # Handle new dict format with test counts
+            if isinstance(result, dict) and result.get("status") == "success":
                 return {
                     "result": True,
                     "solution": solution,
                     "success": True,
-                    "test_passed": True
+                    "test_passed": True,
+                    "passed": result.get("passed", 0),
+                    "total": result.get("total", 0),
+                    "pass_rate": result.get("pass_rate", 1.0)
                 }
-            elif "exec_fail_case" in result:
-                result = result["exec_fail_case"]
+            # Backward compatibility: handle old "no error" string
+            elif result == "no error":
+                return {
+                    "result": True,
+                    "solution": solution,
+                    "success": True,
+                    "test_passed": True,
+                    "passed": 1,
+                    "total": 1,
+                    "pass_rate": 1.0
+                }
+            elif isinstance(result, dict) and "exec_fail_case" in result:
+                error_msg = result["exec_fail_case"]
                 prompt = REFLECTION_ON_PUBLIC_TEST_PROMPT.format(
                     problem=problem,
                     solution=solution,
-                    exec_pass=f"executed unsuccessfully, error: \n {result}",
+                    exec_pass=f"executed unsuccessfully, error: \n {error_msg}",
                     test_fail="executed unsucessfully",
                 )
                 response = await self._fill_node(ReflectionTestOp, prompt, mode="code_fill")
@@ -374,20 +472,45 @@ class Test(Operator):
                 response = await self._fill_node(ReflectionTestOp, prompt, mode="code_fill")
                 solution = response.get("response", solution)
 
-        result = self.exec_code(solution, entry_point)
-        if result == "no error":
+        # Final attempt after all retries
+        result = self.exec_code(solution, entry_point, test_string)
+
+        # Handle new dict format with test counts
+        if isinstance(result, dict) and result.get("status") == "success":
             return {
                 "result": True,
                 "solution": solution,
                 "success": True,
-                "test_passed": True
+                "test_passed": True,
+                "passed": result.get("passed", 0),
+                "total": result.get("total", 0),
+                "pass_rate": result.get("pass_rate", 1.0)
+            }
+        # Backward compatibility
+        elif result == "no error":
+            return {
+                "result": True,
+                "solution": solution,
+                "success": True,
+                "test_passed": True,
+                "passed": 1,
+                "total": 1,
+                "pass_rate": 1.0
             }
         else:
+            # Extract test counts from failed result
+            passed = result.get("passed", 0) if isinstance(result, dict) else 0
+            total = result.get("total", 1) if isinstance(result, dict) else 1
+            pass_rate = result.get("pass_rate", 0.0) if isinstance(result, dict) else 0.0
+
             return {
                 "result": False,
                 "solution": solution,
                 "success": False,
                 "test_passed": False,
+                "passed": passed,
+                "total": total,
+                "pass_rate": pass_rate,
                 "error": str(result)
             }
 
